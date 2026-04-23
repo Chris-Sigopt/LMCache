@@ -941,15 +941,12 @@ class SGLangXPUConnector(GPUConnectorInterface):
         self.num_kv_cache = num_layers if self.use_mla else num_layers * 2
 
         if use_xpu:
-            assert "chunk_size" in kwargs, (
-                "chunk_size should be provided to create a buffer."
-            )
-            assert "device" in kwargs, (
-                "device should be provided to create a buffer."
-            )
-            assert "dtype" in kwargs, (
-                "dtype should be provided to create a buffer."
-            )
+            if "chunk_size" not in kwargs:
+                raise ValueError("chunk_size should be provided to create a buffer.")
+            if "device" not in kwargs:
+                raise ValueError("device should be provided to create a buffer.")
+            if "dtype" not in kwargs:
+                raise ValueError("dtype should be provided to create a buffer.")
             shape = self.get_shape(kwargs["chunk_size"])
             self.gpu_buffer = torch.empty(
                 shape, dtype=kwargs["dtype"], device=kwargs["device"]
@@ -1073,9 +1070,11 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
     def __init__(
         self, hidden_dim_size: int, num_layers: int, use_xpu: bool = False, **kwargs
     ):
-        assert "dtype" in kwargs, "dtype should be provided."
+        if "dtype" not in kwargs:
+            raise ValueError("dtype should be provided.")
         self.dtype = kwargs["dtype"]
-        assert "device" in kwargs, "device should be provided."
+        if "device" not in kwargs:
+            raise ValueError("device should be provided.")
         self.device = kwargs["device"]
 
         self.hidden_dim_size = hidden_dim_size
@@ -1095,7 +1094,12 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
         if "kvcaches" in kwargs:
             self.kvcaches = kwargs["kvcaches"]
 
-    def batched_to_gpu(self, starts, ends, **kwargs):
+    def batched_to_gpu(  # type: ignore[override]
+        self,
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
+    ):
         """Generator: CPU memory objects -> XPU paged KV (per layer).
 
         Yields num_layers + 2 times total:
@@ -1111,13 +1115,6 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
-        slot_mapping_chunks = [
-            slot_mapping[s:e] for s, e in zip(starts, ends, strict=False)
-        ]
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
-
-        offset = starts[0]
-
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
             if layer_id > 0:
@@ -1132,7 +1129,11 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
-                    assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                    if memory_obj.metadata.fmt != MemoryFormat.KV_T2D:
+                        raise ValueError(
+                            f"Expected memory format {MemoryFormat.KV_T2D}, "
+                            f"got {memory_obj.metadata.fmt}"
+                        )
                     # memory_obj.tensor: [num_tokens, 1, hidden_dim]
                     src = memory_obj.tensor.to(self.device)
                     sl = slot_mapping[start:end].to(self.device)
@@ -1166,7 +1167,11 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
-                    assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                    if memory_obj.metadata.fmt != MemoryFormat.KV_T2D:
+                        raise ValueError(
+                            f"Expected memory format {MemoryFormat.KV_T2D}, "
+                            f"got {memory_obj.metadata.fmt}"
+                        )
                     # memory_obj.tensor: [num_tokens, 2, hidden_dim]
                     src = memory_obj.tensor.to(self.device)
                     sl = slot_mapping[start:end].to(self.device)
