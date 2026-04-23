@@ -187,6 +187,7 @@ def assert_layerwise_gpu_connector(gpu_connector: "GPUConnectorInterface"):
         VLLMPagedMemLayerwiseGPUConnector,
     )
     from lmcache.v1.gpu_connector.xpu_connectors import (
+        SGLangLayerwiseXPUConnector,
         VLLMPagedMemLayerwiseXPUConnector,
     )
 
@@ -197,6 +198,7 @@ def assert_layerwise_gpu_connector(gpu_connector: "GPUConnectorInterface"):
             VLLMBufferLayerwiseGPUConnector,
             SGLangLayerwiseGPUConnector,
             VLLMPagedMemLayerwiseXPUConnector,
+            SGLangLayerwiseXPUConnector,
         ),
     )
 

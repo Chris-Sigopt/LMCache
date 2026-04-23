@@ -31,36 +31,75 @@ def CreateGPUConnector(
     use_gpu = need_gpu_interm_buffer(config)
 
     if engine == EngineType.SGLANG:
-        # First Party
-        from lmcache.v1.gpu_connector.gpu_connectors import (
-            SGLangGPUConnector,
-            SGLangLayerwiseGPUConnector,
-        )
-
         num_layer, _, chunk_size, num_kv_head, head_dim = metadata.kv_shape
         hidden_dim_size = num_kv_head * head_dim
         local_worker_id = metadata.local_worker_id
-        torch.cuda.device(local_worker_id)
-        device = torch.device(f"cuda:{local_worker_id}")
         kv_dtype = metadata.kv_dtype
-        if config.use_layerwise:
-            return SGLangLayerwiseGPUConnector(
-                hidden_dim_size,
-                num_layer,
-                use_gpu=use_gpu,
-                chunk_size=chunk_size,
-                dtype=kv_dtype,
-                device=device,
+
+        # Detect device type
+        dev_name = "cuda"
+        try:
+            if torch.xpu.is_available():
+                dev_name = "xpu"
+        except AttributeError:
+            pass
+
+        if dev_name == "xpu":
+            torch.xpu.set_device(local_worker_id)
+            device = torch.device(f"xpu:{local_worker_id}")
+
+            # First Party
+            from lmcache.v1.gpu_connector.xpu_connectors import (
+                SGLangLayerwiseXPUConnector,
+                SGLangXPUConnector,
             )
+
+            if config.use_layerwise:
+                return SGLangLayerwiseXPUConnector(
+                    hidden_dim_size,
+                    num_layer,
+                    use_xpu=use_gpu,
+                    chunk_size=chunk_size,
+                    dtype=kv_dtype,
+                    device=device,
+                )
+            else:
+                return SGLangXPUConnector(
+                    hidden_dim_size,
+                    num_layer,
+                    use_xpu=use_gpu,
+                    chunk_size=chunk_size,
+                    dtype=kv_dtype,
+                    device=device,
+                )
         else:
-            return SGLangGPUConnector(
-                hidden_dim_size,
-                num_layer,
-                use_gpu=use_gpu,
-                chunk_size=chunk_size,
-                dtype=kv_dtype,
-                device=device,
+            # First Party
+            from lmcache.v1.gpu_connector.gpu_connectors import (
+                SGLangGPUConnector,
+                SGLangLayerwiseGPUConnector,
             )
+
+            torch.cuda.device(local_worker_id)
+            device = torch.device(f"cuda:{local_worker_id}")
+
+            if config.use_layerwise:
+                return SGLangLayerwiseGPUConnector(
+                    hidden_dim_size,
+                    num_layer,
+                    use_gpu=use_gpu,
+                    chunk_size=chunk_size,
+                    dtype=kv_dtype,
+                    device=device,
+                )
+            else:
+                return SGLangGPUConnector(
+                    hidden_dim_size,
+                    num_layer,
+                    use_gpu=use_gpu,
+                    chunk_size=chunk_size,
+                    dtype=kv_dtype,
+                    device=device,
+                )
     elif engine == EngineType.VLLM:
         # First Party
         from lmcache.integration.vllm.utils import get_vllm_torch_dev

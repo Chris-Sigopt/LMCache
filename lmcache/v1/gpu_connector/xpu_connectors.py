@@ -914,3 +914,346 @@ class VLLMPagedMemLayerwiseXPUConnector(GPUConnectorInterface):
         if self.use_mla:
             return torch.Size([num_tokens, self.hidden_dim_size])
         return torch.Size([num_tokens, 2, self.hidden_dim_size])
+
+
+class SGLangXPUConnector(GPUConnectorInterface):
+    """
+    XPU connector for SGLang KV cache transfer.
+
+    SGLang KV cache layout:
+    - kvcaches: [[k_list], [v_list]]
+      - k_list / v_list: List of tensors, one per layer
+      - Each tensor: [page_buffer_size, num_heads, head_size]
+
+    Uses pure PyTorch index_copy_/index_select ops instead of CUDA kernels.
+    Produces/consumes memory objects with KV_2LTD format.
+    """
+
+    def __init__(
+        self, hidden_dim_size: int, num_layers: int, use_xpu: bool = False, **kwargs
+    ):
+        self.hidden_dim_size = hidden_dim_size
+        self.num_layers = num_layers
+        self.use_xpu = use_xpu
+
+        self.gpu_buffer: Optional[torch.Tensor] = None
+        self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        self.num_kv_cache = num_layers if self.use_mla else num_layers * 2
+
+        if use_xpu:
+            assert "chunk_size" in kwargs, (
+                "chunk_size should be provided to create a buffer."
+            )
+            assert "device" in kwargs, (
+                "device should be provided to create a buffer."
+            )
+            assert "dtype" in kwargs, (
+                "dtype should be provided to create a buffer."
+            )
+            shape = self.get_shape(kwargs["chunk_size"])
+            self.gpu_buffer = torch.empty(
+                shape, dtype=kwargs["dtype"], device=kwargs["device"]
+            )
+            logger.info(f"XPU buffer: {self.gpu_buffer.shape}")
+
+    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        assert memory_obj.tensor is not None
+
+        if self.use_mla:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format for "
+                    f"{self.__class__.__name__}"
+                )
+        else:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
+                raise ValueError(
+                    "The memory object should be in KV_2LTD format for "
+                    f"{self.__class__.__name__}"
+                )
+
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        offset = kwargs.get("offset", 0)
+        kvcaches = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slices = slot_mapping[start - offset : end - offset]
+
+        data = memory_obj.tensor.to(slices.device)
+
+        if self.use_mla:
+            # MLA: kvcaches is List[tensor_per_layer], each [P, 1, head_size]
+            # data shape: [num_layers, num_tokens, hidden_dim]
+            for layer_id in range(self.num_layers):
+                cache = kvcaches[layer_id]  # [P, 1, head_size]
+                t = cache.shape[0]
+                h_d = cache.shape[1] * cache.shape[2]
+                cache.view(t, h_d).index_copy_(0, slices, data[layer_id])
+        else:
+            # MHA: kvcaches is [[k0, k1, ...], [v0, v1, ...]]
+            # data shape: [2, num_layers, num_tokens, hidden_dim]
+            for layer_id in range(self.num_layers):
+                k_cache = kvcaches[0][layer_id]  # [P, H, D]
+                v_cache = kvcaches[1][layer_id]
+                t = k_cache.shape[0]
+                h_d = k_cache.shape[1] * k_cache.shape[2]
+                k_cache.view(t, h_d).index_copy_(0, slices, data[0, layer_id])
+                v_cache.view(t, h_d).index_copy_(0, slices, data[1, layer_id])
+
+    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        assert memory_obj.tensor is not None
+
+        if "kvcaches" not in kwargs:
+            raise ValueError("'kvcaches' should be provided in kwargs.")
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        kvcaches = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slices = slot_mapping[start:end]
+
+        if self.use_mla:
+            # MLA: kvcaches is List[tensor_per_layer], each [P, 1, head_size]
+            layers = []
+            for layer_id in range(self.num_layers):
+                cache = kvcaches[layer_id]
+                t = cache.shape[0]
+                h_d = cache.shape[1] * cache.shape[2]
+                layers.append(cache.view(t, h_d).index_select(0, slices))
+            # Stack into [num_layers, num_tokens, hidden_dim]
+            result = torch.stack(layers)
+            memory_obj.tensor.copy_(result, non_blocking=True)
+            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        else:
+            # MHA: kvcaches is [[k_list], [v_list]]
+            k_layers = []
+            v_layers = []
+            for layer_id in range(self.num_layers):
+                k_cache = kvcaches[0][layer_id]
+                v_cache = kvcaches[1][layer_id]
+                t = k_cache.shape[0]
+                h_d = k_cache.shape[1] * k_cache.shape[2]
+                k_layers.append(k_cache.view(t, h_d).index_select(0, slices))
+                v_layers.append(v_cache.view(t, h_d).index_select(0, slices))
+            # Stack into [2, num_layers, num_tokens, hidden_dim]
+            result = torch.stack([torch.stack(k_layers), torch.stack(v_layers)])
+            memory_obj.tensor.copy_(result, non_blocking=True)
+
+        if not memory_obj.tensor.is_xpu:
+            torch.xpu.synchronize()
+
+    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+            self.to_gpu(memory_obj, start, end, **kwargs)
+
+    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+            self.from_gpu(memory_obj, start, end, **kwargs)
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        if self.use_mla:
+            return torch.Size([self.num_layers, num_tokens, self.hidden_dim_size])
+        return torch.Size([2, self.num_layers, num_tokens, self.hidden_dim_size])
+
+
+class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
+    """
+    Layerwise XPU connector for SGLang KV cache transfer.
+
+    Implements the same generator contract as SGLangLayerwiseGPUConnector:
+      - batched_to_gpu(...) yields num_layers + 1 times
+      - batched_from_gpu(...) yields num_layers + 1 times
+
+    Uses pure PyTorch index_copy_/index_select ops on XPU.
+    """
+
+    def __init__(
+        self, hidden_dim_size: int, num_layers: int, use_xpu: bool = False, **kwargs
+    ):
+        assert "dtype" in kwargs, "dtype should be provided."
+        self.dtype = kwargs["dtype"]
+        assert "device" in kwargs, "device should be provided."
+        self.device = kwargs["device"]
+
+        self.hidden_dim_size = hidden_dim_size
+        self.num_layers = num_layers
+        self.use_xpu = use_xpu
+        self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        self.num_kv_cache = num_layers if self.use_mla else num_layers * 2
+
+    def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        raise NotImplementedError("Layerwise uses batched_to_gpu (generator).")
+
+    def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        raise NotImplementedError("Layerwise uses batched_from_gpu (generator).")
+
+    def initialize_kvcaches_ptr(self, **kwargs):
+        """Override base to handle SGLang's nested [[k_list], [v_list]] format."""
+        if "kvcaches" in kwargs:
+            self.kvcaches = kwargs["kvcaches"]
+
+    def batched_to_gpu(self, starts, ends, **kwargs):
+        """Generator: CPU memory objects -> XPU paged KV (per layer).
+
+        Yields num_layers + 2 times total:
+        - First num_layers yields receive memory_objs_layer via send()
+        - Sync yield after processing
+        - Final yield signals completion
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        slot_mapping_chunks = [
+            slot_mapping[s:e] for s, e in zip(starts, ends, strict=False)
+        ]
+        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+
+        offset = starts[0]
+
+        for layer_id in range(self.num_layers):
+            memory_objs_layer = yield
+            if layer_id > 0:
+                logger.debug(f"Finished loading layer {layer_id - 1}")
+
+            if self.use_mla:
+                # MLA: kvcaches is List[tensor_per_layer], each [P, 1, D]
+                cache = self.kvcaches[layer_id]
+                t = cache.shape[0]
+                h_d = cache.shape[1] * cache.shape[2]
+
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                    # memory_obj.tensor: [num_tokens, 1, hidden_dim]
+                    src = memory_obj.tensor.to(self.device)
+                    sl = slot_mapping[start:end].to(self.device)
+                    # src is [T, 1, D], reshape to [T, D]
+                    data = src.view(src.shape[0], -1)
+
+                    valid = sl >= 0
+                    if not valid.all():
+                        sl = sl[valid]
+                        data = data[valid]
+
+                    if sl.numel() == 0:
+                        continue
+
+                    max_slot = sl.max().item()
+                    if max_slot >= t:
+                        logger.warning(
+                            f"Layer {layer_id}: slot index {max_slot} >= "
+                            f"cache size {t}, clamping"
+                        )
+                        sl = sl.clamp(max=t - 1)
+
+                    cache.view(t, h_d).index_copy_(0, sl, data)
+            else:
+                # MHA: kvcaches is [[k_list], [v_list]]
+                k_cache = self.kvcaches[0][layer_id]  # [P, H, D]
+                v_cache = self.kvcaches[1][layer_id]
+                t = k_cache.shape[0]
+                h_d = k_cache.shape[1] * k_cache.shape[2]
+
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                    # memory_obj.tensor: [num_tokens, 2, hidden_dim]
+                    src = memory_obj.tensor.to(self.device)
+                    sl = slot_mapping[start:end].to(self.device)
+                    k_data, v_data = _split_token2d_kv(src)
+
+                    valid = sl >= 0
+                    if not valid.all():
+                        sl = sl[valid]
+                        k_data = k_data[valid]
+                        v_data = v_data[valid]
+
+                    if sl.numel() == 0:
+                        continue
+
+                    max_slot = sl.max().item()
+                    if max_slot >= t:
+                        logger.warning(
+                            f"Layer {layer_id}: slot index {max_slot} >= "
+                            f"cache size {t}, clamping"
+                        )
+                        sl = sl.clamp(max=t - 1)
+
+                    k_cache.view(t, h_d).index_copy_(0, sl, k_data)
+                    v_cache.view(t, h_d).index_copy_(0, sl, v_data)
+
+        logger.debug(f"Finished loading layer {layer_id}")
+        yield  # sync yield
+        yield  # final yield
+
+    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+        """Generator: XPU paged KV -> CPU memory objects (per layer).
+
+        Yields num_layers + 1 times total.
+        """
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None
+
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        for layer_id in range(self.num_layers):
+            memory_objs_layer = memory_objs[layer_id]
+
+            if self.use_mla:
+                # MLA: kvcaches is List[tensor_per_layer], each [P, 1, D]
+                cache = self.kvcaches[layer_id]
+                t = cache.shape[0]
+                h_d = cache.shape[1] * cache.shape[2]
+
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    assert memory_obj.tensor is not None
+                    sl = slot_mapping[start:end].to(self.device)
+                    data = cache.view(t, h_d).index_select(0, sl)
+                    # memory_obj.tensor: [num_tokens, 1, hidden_dim]
+                    out = data.unsqueeze(1)  # [T, D] -> [T, 1, D]
+                    memory_obj.tensor.copy_(
+                        out.to(memory_obj.tensor.device), non_blocking=True
+                    )
+            else:
+                # MHA: kvcaches is [[k_list], [v_list]]
+                k_cache = self.kvcaches[0][layer_id]
+                v_cache = self.kvcaches[1][layer_id]
+                t = k_cache.shape[0]
+                h_d = k_cache.shape[1] * k_cache.shape[2]
+
+                for start, end, memory_obj in zip(
+                    starts, ends, memory_objs_layer, strict=False
+                ):
+                    assert memory_obj.tensor is not None
+                    sl = slot_mapping[start:end].to(self.device)
+                    k_data = k_cache.view(t, h_d).index_select(0, sl)
+                    v_data = v_cache.view(t, h_d).index_select(0, sl)
+                    # memory_obj.tensor: [num_tokens, 2, hidden_dim]
+                    out = torch.stack([k_data, v_data], dim=1)
+                    memory_obj.tensor.copy_(
+                        out.to(memory_obj.tensor.device), non_blocking=True
+                    )
+
+            yield
+            logger.debug(f"Finished offloading layer {layer_id}")
+
+        yield
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        kv_dim = 1 if self.use_mla else 2
+        return torch.Size([num_tokens, kv_dim, self.hidden_dim_size])
