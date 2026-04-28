@@ -36,13 +36,19 @@ def CreateGPUConnector(
         local_worker_id = metadata.local_worker_id
         kv_dtype = metadata.kv_dtype
 
-        # Detect device type
-        dev_name = "cuda"
-        try:
-            if torch.xpu.is_available():
-                dev_name = "xpu"
-        except AttributeError:
-            pass
+        # Prefer serving-engine device hint to avoid misrouting workloads
+        # when multiple backends are available on the same node.
+        dev_name = metadata.device_type
+        if dev_name not in {"cuda", "xpu"}:
+            # Backward-compatible fallback for metadata created by older paths.
+            dev_name = "cuda"
+            try:
+                if torch.cuda.is_available():
+                    dev_name = "cuda"
+                elif torch.xpu.is_available():
+                    dev_name = "xpu"
+            except AttributeError:
+                pass
 
         if dev_name == "xpu":
             torch.xpu.set_device(local_worker_id)

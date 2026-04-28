@@ -248,6 +248,91 @@ def test_sglang_xpu_connector_roundtrip_multi_chunk(use_xpu: bool, use_mla: bool
         pin_alloc.close()
 
 
+@pytest.mark.parametrize("use_xpu", [False, True])
+def test_sglang_xpu_connector_roundtrip_flat_kv_lists(use_xpu: bool):
+    """Non-layerwise MHA accepts flat k_pool + v_pool cache lists."""
+    _skip_if_no_xpu()
+    device = torch.device("xpu:0")
+
+    num_layers = 2
+    num_blocks = 4
+    block_size = 16
+    num_heads = 8
+    head_size = 64
+    num_tokens = 32
+    hidden_dim = num_heads * head_size
+
+    kvcaches_nested = generate_sglang_kv_cache_paged_list_tensors(
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_heads=num_heads,
+        head_size=head_size,
+        use_mla=False,
+        device=device,
+    )
+    kvcaches_flat = kvcaches_nested[0] + kvcaches_nested[1]
+
+    total_slots = num_blocks * block_size
+    slot_mapping = _make_unique_slot_mapping(
+        total_slots=total_slots, num_tokens=num_tokens, device=device
+    )
+
+    conn = SGLangXPUConnector(
+        hidden_dim_size=hidden_dim,
+        num_layers=num_layers,
+        use_xpu=use_xpu,
+        chunk_size=num_tokens,
+        dtype=torch.bfloat16,
+        device=device,
+        use_mla=False,
+    )
+
+    pin_alloc = PinMemoryAllocator(size=1024 * 1024 * 64)
+    memobj = pin_alloc.allocate(
+        conn.get_shape(num_tokens), torch.bfloat16, MemoryFormat.KV_2LTD
+    )
+
+    try:
+        # XPU -> CPU from flat cache list
+        conn.from_gpu(
+            memobj,
+            start=0,
+            end=num_tokens,
+            slot_mapping=slot_mapping,
+            kvcaches=kvcaches_flat,
+        )
+
+        # CPU -> XPU into fresh flat cache list
+        kvcaches_dst_nested = generate_sglang_kv_cache_paged_list_tensors(
+            num_layers=num_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_heads=num_heads,
+            head_size=head_size,
+            use_mla=False,
+            device=device,
+        )
+        _zero_kvcaches(kvcaches_dst_nested, use_mla=False)
+        kvcaches_dst_flat = kvcaches_dst_nested[0] + kvcaches_dst_nested[1]
+
+        conn.to_gpu(
+            memobj,
+            start=0,
+            end=num_tokens,
+            slot_mapping=slot_mapping,
+            kvcaches=kvcaches_dst_flat,
+        )
+
+        check_sglang_paged_kv_cache_equal(
+            kvcaches_nested, kvcaches_dst_nested, slot_mapping,
+            num_heads=num_heads, head_size=head_size,
+        )
+    finally:
+        memobj.ref_count_down()
+        pin_alloc.close()
+
+
 # --------------------------------------------------------------------------- #
 # Layerwise (SGLangLayerwiseXPUConnector)
 # --------------------------------------------------------------------------- #

@@ -68,6 +68,8 @@ class LMCacheMetadata:
     engine_id: Optional[str] = None
     """ extra config from kv_connector (e.g., lmcache_rpc_port) """
     kv_connector_extra_config: Optional[dict] = None
+    """runtime compute device type (e.g., 'cuda', 'xpu', 'hpu', 'cpu')"""
+    device_type: Optional[str] = None
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""

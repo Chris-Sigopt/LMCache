@@ -47,6 +47,7 @@ def init_lmcache_engine(
     local_rank: int,
     global_rank: int,
     kv_dtype: torch.dtype,
+    device_type: Optional[str] = None,
 ) -> LMCacheEngine:
     """
     Initialize LMCache engine for SGLang integration.
@@ -57,6 +58,7 @@ def init_lmcache_engine(
         local_rank: Local GPU device index (for device selection)
         global_rank: Global tensor parallel rank (for metadata)
         kv_dtype: Data type for KV cache tensors
+        device_type: Runtime device type for connector selection
     """
     if curr_engine := LMCacheEngineBuilder.get(ENGINE_NAME):
         return curr_engine
@@ -84,6 +86,7 @@ def init_lmcache_engine(
         local_worker_id=local_rank,
         kv_dtype=kv_dtype,
         kv_shape=kv_shape,
+        device_type=device_type,
     )
 
     gpu_connector = CreateGPUConnector(config, metadata, EngineType.SGLANG)
@@ -125,6 +128,7 @@ class LMCacheConnector:
             local_rank,
             rank,  # global_rank (tp_rank) for metadata
             kv_dtype,
+            device_type=self._device.type,
         )
         self.sgl_config = sgl_config
         self.tp_size = tp_size
@@ -144,11 +148,6 @@ class LMCacheConnector:
         )
         slot_mapping = load_metadata.slot_mapping.to(self._device)
         offset = load_metadata.offset
-
-        if not isinstance(token_ids, torch.Tensor):
-            raise TypeError("token_ids must be a torch.Tensor")
-        if not isinstance(slot_mapping, torch.Tensor):
-            raise TypeError("slot_mapping must be a torch.Tensor")
         if (len(token_ids) - offset) != len(slot_mapping):
             raise ValueError(
                 "Length of token_ids (minus offset) must match slot_mapping length"
@@ -174,11 +173,6 @@ class LMCacheConnector:
         )
         slot_mapping = store_metadata.kv_indices.to(torch.int64).to(self._device)
         offset = store_metadata.offset
-
-        if not isinstance(token_ids, torch.Tensor):
-            raise TypeError("token_ids must be a torch.Tensor")
-        if not isinstance(slot_mapping, torch.Tensor):
-            raise TypeError("slot_mapping must be a torch.Tensor")
         if len(token_ids) != len(slot_mapping):
             raise ValueError("Length of token_ids must match slot_mapping length")
         store_mask = torch.ones_like(token_ids, dtype=torch.bool)

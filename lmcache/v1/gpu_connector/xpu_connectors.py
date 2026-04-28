@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Standard
-from typing import List, Optional, Union, cast
+from typing import List, Optional, Tuple, Union, cast
 import os
 
 # Third Party
@@ -955,6 +955,44 @@ class SGLangXPUConnector(GPUConnectorInterface):
             )
             logger.info(f"XPU buffer: {self.gpu_buffer.shape}")
 
+    def _normalize_sglang_kvcaches(
+        self, kvcaches
+    ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+        """Normalize SGLang KV caches to the canonical connector layout.
+
+        MLA expects a per-layer list of tensors.
+        MHA accepts either:
+        - nested: [k_list, v_list]
+        - flat: k_list + v_list
+        """
+        if self.use_mla:
+            if not isinstance(kvcaches, list) or len(kvcaches) != self.num_layers:
+                raise ValueError(
+                    "For MLA, expected kvcaches as a list of tensors with "
+                    f"length {self.num_layers}."
+                )
+            return kvcaches
+
+        if isinstance(kvcaches, list) and len(kvcaches) == 2 and all(
+            isinstance(v, list) for v in kvcaches
+        ):
+            k_list, v_list = kvcaches
+        elif isinstance(kvcaches, list) and len(kvcaches) == self.num_layers * 2:
+            k_list = kvcaches[: self.num_layers]
+            v_list = kvcaches[self.num_layers :]
+        else:
+            raise ValueError(
+                "For non-MLA, expected kvcaches as [k_list, v_list] or "
+                "a flat concatenation (k_list + v_list)."
+            )
+
+        if len(k_list) != self.num_layers or len(v_list) != self.num_layers:
+            raise ValueError(
+                "For non-MLA, k_list and v_list must each have "
+                f"length {self.num_layers}."
+            )
+        return k_list, v_list
+
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         assert memory_obj.tensor is not None
 
@@ -977,7 +1015,7 @@ class SGLangXPUConnector(GPUConnectorInterface):
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
         offset = kwargs.get("offset", 0)
-        kvcaches = kwargs["kvcaches"]
+        kvcaches = self._normalize_sglang_kvcaches(kwargs["kvcaches"])
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start - offset : end - offset]
 
@@ -993,10 +1031,11 @@ class SGLangXPUConnector(GPUConnectorInterface):
                 cache.view(t, h_d).index_copy_(0, slices, data[layer_id])
         else:
             # MHA: kvcaches is [[k0, k1, ...], [v0, v1, ...]]
+            k_list, v_list = kvcaches
             # data shape: [2, num_layers, num_tokens, hidden_dim]
             for layer_id in range(self.num_layers):
-                k_cache = kvcaches[0][layer_id]  # [P, H, D]
-                v_cache = kvcaches[1][layer_id]
+                k_cache = k_list[layer_id]  # [P, H, D]
+                v_cache = v_list[layer_id]
                 t = k_cache.shape[0]
                 h_d = k_cache.shape[1] * k_cache.shape[2]
                 k_cache.view(t, h_d).index_copy_(0, slices, data[0, layer_id])
@@ -1010,7 +1049,7 @@ class SGLangXPUConnector(GPUConnectorInterface):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        kvcaches = kwargs["kvcaches"]
+        kvcaches = self._normalize_sglang_kvcaches(kwargs["kvcaches"])
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         slices = slot_mapping[start:end]
 
@@ -1028,11 +1067,12 @@ class SGLangXPUConnector(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
         else:
             # MHA: kvcaches is [[k_list], [v_list]]
+            k_list, v_list = kvcaches
             k_layers = []
             v_layers = []
             for layer_id in range(self.num_layers):
-                k_cache = kvcaches[0][layer_id]
-                v_cache = kvcaches[1][layer_id]
+                k_cache = k_list[layer_id]
+                v_cache = v_list[layer_id]
                 t = k_cache.shape[0]
                 h_d = k_cache.shape[1] * k_cache.shape[2]
                 k_layers.append(k_cache.view(t, h_d).index_select(0, slices))
@@ -1044,11 +1084,13 @@ class SGLangXPUConnector(GPUConnectorInterface):
         if not memory_obj.tensor.is_xpu:
             torch.xpu.synchronize()
 
-    def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_to_gpu(self, memory_objs: Union[
+            List[List[MemoryObj]], List[MemoryObj], List[int], None
+        ], starts: Optional[List[int]], ends: Optional[List[int]], **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.to_gpu(memory_obj, start, end, **kwargs)
 
-    def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+    def batched_from_gpu(self, memory_objs: List[List[MemoryObj]], starts: List[int], ends: List[int], **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
 
@@ -1190,11 +1232,10 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
 
                     max_slot = sl.max().item()
                     if max_slot >= t:
-                        logger.warning(
+                        raise ValueError(
                             f"Layer {layer_id}: slot index {max_slot} >= "
-                            f"cache size {t}, clamping"
+                            f"cache size {t}"
                         )
-                        sl = sl.clamp(max=t - 1)
 
                     k_cache.view(t, h_d).index_copy_(0, sl, k_data)
                     v_cache.view(t, h_d).index_copy_(0, sl, v_data)
@@ -1248,6 +1289,14 @@ class SGLangLayerwiseXPUConnector(GPUConnectorInterface):
                 ):
                     assert memory_obj.tensor is not None
                     sl = slot_mapping[start:end].to(self.device)
+
+                    max_slot = sl.max().item()
+                    if max_slot >= t:
+                        raise ValueError(
+                            f"Layer {layer_id}: slot index {max_slot} >= "
+                            f"cache size {t}"
+                        )
+
                     k_data = k_cache.view(t, h_d).index_select(0, sl)
                     v_data = v_cache.view(t, h_d).index_select(0, sl)
                     # memory_obj.tensor: [num_tokens, 2, hidden_dim]
