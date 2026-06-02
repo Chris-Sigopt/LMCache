@@ -14,7 +14,7 @@ import torch
 from lmcache.utils import mock_up_broadcast_fn, mock_up_broadcast_object_fn
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.gpu_connector.xpu_connectors import VLLMPagedMemXPUConnectorV2
+from lmcache.v1.gpu_connector.xpu_connectors import VLLMPagedMemXPUConnectorV2, SGLangXPUConnector
 from tests.v1.utils import (
     dumb_metadata,
     generate_kv_cache_paged_list_tensors,
@@ -79,16 +79,27 @@ def _create_connector(
     chunk_size: int,
     dtype: torch.dtype,
     use_mla: bool = False,
+    use_vllm: bool = True,
 ):
-    return VLLMPagedMemXPUConnectorV2(
-        hidden_dim_size=hidden_dim,
-        num_layers=num_layers,
-        use_gpu=use_gpu,
-        chunk_size=chunk_size,
-        dtype=dtype,
-        use_mla=use_mla,
-        device=device,
-    )
+    if use_vllm:
+        return VLLMPagedMemXPUConnectorV2(
+            hidden_dim_size=hidden_dim,
+            num_layers=num_layers,
+            use_gpu=use_gpu,
+            chunk_size=chunk_size,
+            dtype=dtype,
+            use_mla=use_mla,
+            device=device,
+        )
+    else: #Use sglang adapter
+        return SGLangXPUConnector(
+            hidden_dim_size=hidden_dim,
+            num_layers=num_layers,
+            use_gpu=use_gpu,
+            chunk_size=chunk_size,
+            dtype=dtype,
+            device=device,
+        )
 
 
 def _v2_store_vllm_contract(
@@ -210,11 +221,13 @@ def _build_engine(
 
 
 @pytest.mark.no_shared_allocator
+@pytest.mark.benchmark_serial
 @pytest.mark.benchmark(group="store-v2")
 @pytest.mark.parametrize("device_type", DEVICE_PARAMS)
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("use_gpu", [False, True])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
 def test_store_1gb_v2(
     benchmark,
     device_type,
@@ -223,6 +236,7 @@ def test_store_1gb_v2(
     save_unfull_chunk,
     create_config,
     autorelease_v1,
+    engine,
 ):
     _skip_if_no_xpu()
 
@@ -248,6 +262,7 @@ def test_store_1gb_v2(
         chunk_size=chunk_size,
         dtype=dtype,
         use_mla=False,
+        use_vllm=(engine == "vllm")
     )
 
     kv_cache = generate_kv_cache_paged_list_tensors(
@@ -298,11 +313,13 @@ def test_store_1gb_v2(
 
 
 @pytest.mark.no_shared_allocator
+@pytest.mark.benchmark_serial
 @pytest.mark.benchmark(group="retrieve-v2")
 @pytest.mark.parametrize("device_type", DEVICE_PARAMS)
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("use_gpu", [False, True])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
 def test_retrieve_1gb_allhit_v2(
     benchmark,
     device_type,
@@ -311,6 +328,7 @@ def test_retrieve_1gb_allhit_v2(
     save_unfull_chunk,
     create_config,
     autorelease_v1,
+    engine,
 ):
     _skip_if_no_xpu()
 
@@ -336,6 +354,7 @@ def test_retrieve_1gb_allhit_v2(
         chunk_size=chunk_size,
         dtype=dtype,
         use_mla=False,
+        use_vllm=(engine == "vllm")
     )
 
     kv_cache = generate_kv_cache_paged_list_tensors(
@@ -391,11 +410,13 @@ def test_retrieve_1gb_allhit_v2(
 
 
 @pytest.mark.no_shared_allocator
+@pytest.mark.benchmark_serial
 @pytest.mark.benchmark(group="lookup-v2")
 @pytest.mark.parametrize("device_type", DEVICE_PARAMS)
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("use_gpu", [False, True])
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
 def test_lookup_20k_tokens_v2(
     benchmark,
     device_type,
@@ -404,6 +425,7 @@ def test_lookup_20k_tokens_v2(
     save_unfull_chunk,
     create_config,
     autorelease_v1,
+    engine,
 ):
     _skip_if_no_xpu()
 
@@ -430,6 +452,7 @@ def test_lookup_20k_tokens_v2(
         chunk_size=chunk_size,
         dtype=dtype,
         use_mla=False,
+        use_vllm=(engine == "vllm")
     )
 
     kv_cache = generate_kv_cache_paged_list_tensors(
